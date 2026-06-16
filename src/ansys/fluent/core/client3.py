@@ -1,3 +1,24 @@
+# Copyright (C) 2021 - 2026 ANSYS, Inc. and/or its affiliates.
+# SPDX-License-Identifier: MIT
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Thin HTTP client for the Fluent Settings Service REST API.
 
 This client is a **transport layer only**. It builds URLs, attaches
@@ -22,7 +43,6 @@ import urllib.request
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
 _RETRYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
@@ -31,21 +51,58 @@ _RETRYABLE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 # ------------------------------------------------------------------
 
 class FluentRestError(RuntimeError):
-    """HTTP error returned by the Fluent REST server.
+    """HTTP error raised when a Fluent REST request fails.
+
+    This class is the **single place** that understands how to interpret
+    transport-level failures.  It knows which HTTP status codes come from
+    the server vs. which originate from a broken connection, and it knows
+    which failures are transient enough to be worth retrying.
 
     Attributes
     ----------
     status : int
-        HTTP status code (``0`` for connection-level failures).
+        HTTP status code.  ``0`` means the request never reached the
+        server (connection refused, reset, DNS failure, etc.).
     retryable : bool
-        ``True`` for transient transport failures (502/503/504,
-        connection drops) that are safe to re-issue.
+        ``True`` when the failure is transient — a 502/503/504 gateway
+        error or a connection-level ``OSError`` — and re-issuing the
+        same request has a reasonable chance of succeeding.
     """
+
+    _RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
 
     def __init__(self, status: int, message: str, *, retryable: bool = False) -> None:
         self.status = status
         self.retryable = retryable
         super().__init__(f"HTTP {status}: {message}")
+
+    @classmethod
+    def from_transport(cls, exc: OSError) -> "FluentRestError":
+        """Construct from a stdlib transport exception.
+
+        ``urllib`` raises ``HTTPError`` (a subclass of ``OSError``) when
+        the server replies with an error status, and plain ``OSError``
+        when the connection itself fails.  This factory inspects the
+        exception once and produces a fully-populated domain error.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return cls(
+                exc.code,
+                cls._read_server_message(exc),
+                retryable=exc.code in cls._RETRYABLE_STATUS_CODES,
+            )
+        return cls(0, cls._read_connection_message(exc), retryable=True)
+
+    @staticmethod
+    def _read_server_message(exc: urllib.error.HTTPError) -> str:
+        """Extract the plain-text body the server sent with the error."""
+        raw = exc.read().decode("utf-8", errors="replace")
+        return raw.strip() or exc.reason
+
+    @staticmethod
+    def _read_connection_message(exc: OSError) -> str:
+        """Produce a human-readable message from a connection failure."""
+        return str(getattr(exc, "reason", exc))
 
 
 # ------------------------------------------------------------------
@@ -160,36 +217,32 @@ class FluentRestClient:
             except json.JSONDecodeError:
                 return {}
 
-    @staticmethod
-    def _read_error_body(exc: urllib.error.HTTPError) -> str:
-        """Extract the plain-text error message the server sent back."""
-        raw = exc.read().decode("utf-8", errors="replace")
-        return raw.strip() or exc.reason
-
     def _send(self, req: urllib.request.Request) -> Any:
-        """Send one request, translating transport errors to FluentRestError.
-
-        Marks each error ``retryable`` so the caller (``_request``) can
-        decide whether to re-issue without inspecting raw exception types.
-        """
+        """Execute one HTTP call, raising :class:`FluentRestError` on failure."""
         try:
             return self._send_once(req)
-        except urllib.error.HTTPError as exc:
-            raise FluentRestError(
-                exc.code,
-                self._read_error_body(exc),
-                retryable=exc.code in _RETRYABLE_STATUS_CODES,
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise FluentRestError(
-                0, str(exc.reason), retryable=True
-            ) from exc
         except OSError as exc:
-            raise FluentRestError(0, str(exc)) from exc
+            raise FluentRestError.from_transport(exc) from exc
 
     def _back_off(self, attempt: int) -> None:
         """Sleep with exponential back-off before the next retry."""
         time.sleep(self._retry_delay * (2**attempt))
+
+    def _send_with_retry(self, req: urllib.request.Request, retries: int) -> Any:
+        """Execute *req*, retrying up to *retries* times on transient failures.
+
+        The loop covers the retry-eligible attempts.  After all retries
+        are exhausted, a final ``_send`` runs with no exception handling —
+        if it fails, the error propagates naturally.
+        """
+        for attempt in range(retries):
+            try:
+                return self._send(req)
+            except FluentRestError as exc:
+                if not exc.retryable:
+                    raise
+                self._back_off(attempt)
+        return self._send(req)
 
     def _request(
         self,
@@ -203,15 +256,7 @@ class FluentRestClient:
             raise FluentRestError(0, "Session is closed")
         req = self._build_request(method, endpoint, body)
         retries = self._max_retries if method.upper() in _RETRYABLE_METHODS else 0
-
-        for attempt in range(retries + 1):
-            try:
-                return self._send(req)
-            except FluentRestError as exc:
-                if exc.retryable and attempt < retries:
-                    self._back_off(attempt)
-                    continue
-                raise
+        return self._send_with_retry(req, retries)
 
     # ------------------------------------------------------------------
     # Settings API — discovery
